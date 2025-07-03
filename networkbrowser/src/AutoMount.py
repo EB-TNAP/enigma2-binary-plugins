@@ -29,6 +29,10 @@ class AutoMount():
 		self.restartConsole = Console()
 		self.MountConsole = Console()
 		self.removeConsole = Console()
+		self.mountTimer = eTimer()
+		self.mountTimer.callback.append(self.mountTimeout)
+		self.currentMountData = None
+		self.currentMountCallback = None
 		self.activeMountsCounter = 0
 		# Initialize Timer
 		self.callback = None
@@ -282,12 +286,43 @@ class AutoMount():
 
 		# execute any command constructed
 		if command:
+			# Store current mount info for timeout handling
+			self.currentMountData = data
+			self.currentMountCallback = callback
+			
+			# Start 30-second timeout timer
+			self.mountTimer.start(30000, True)  # 30 seconds, single shot
+			
 			self.MountConsole.ePopen(command, self.CheckMountPointFinished, [data, callback])
 		else:
 			self.CheckMountPointFinished(None, None, [data, callback])
 
+	def mountTimeout(self):
+		"""Handle mount timeout - kill hanging mount processes"""
+		print("[AutoMount.py] Mount timeout reached - killing mount process")
+		
+		# Stop the mount console to kill hanging processes
+		if self.MountConsole:
+			for appContainer in self.MountConsole.appContainers[:]:
+				print("[AutoMount.py] Killing hanging mount process")
+				appContainer.kill()
+		
+		# Call the callback with failure
+		if self.currentMountCallback and self.currentMountData:
+			print("[AutoMount.py] Mount timed out for", self.currentMountData.get('sharename', 'unknown'))
+			self.CheckMountPointFinished("TIMEOUT", 1, [self.currentMountData, self.currentMountCallback])
+
 	def CheckMountPointFinished(self, result, retval, extra_args):
 		print("[AutoMount.py] CheckMountPointFinished", result, retval)
+		
+		# Stop the timeout timer since mount completed (success or failure)
+		if self.mountTimer.isActive():
+			self.mountTimer.stop()
+		
+		# Clear current mount data
+		self.currentMountData = None
+		self.currentMountCallback = None
+		
 		(data, callback) = extra_args
 		path = os.path.join('/media/net', data['sharename'])
 		print("[AutoMount.py] CheckMountPointFinished, verifying: ", path)

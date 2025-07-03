@@ -9,6 +9,7 @@ from Components.Sources.Boolean import Boolean
 
 from . import _
 from .AutoMount import iAutoMount
+from .MountPresets import get_all_presets, get_preset_options, suggest_preset_for_device
 
 
 def convertIP(ip):
@@ -61,6 +62,10 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		self.list = []
 		ConfigListScreen.__init__(self, self.list, session=self.session)
 		self.createSetup()
+		
+		# Add preset change notifier after ConfigListScreen is ready
+		self.presetConfigEntry.addNotifier(self.presetChanged)
+		
 		self.onLayoutFinish.append(self.layoutFinished)
 		# Initialize Buttons
 		self["VKeyIcon"] = Boolean(False)
@@ -86,7 +91,9 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		self.usernameEntry = None
 		self.passwordEntry = None
 		self.hdd_replacementEntry = None
+		self.presetEntry = None
 		self.sharetypelist = [("nfs", _("NFS share")), ("cifs", _("CIFS share"))]
+		self.presetlist = get_all_presets()
 
 		mounttype = self.mountinfo.get('mounttype')
 		if not mounttype:
@@ -137,6 +144,7 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		self.passwordConfigEntry = NoSave(ConfigPassword(default=password, visible_width=50, fixed_size=False))
 		self.mounttypeConfigEntry = NoSave(ConfigSelection(self.sharetypelist, default=mounttype))
 		self.hdd_replacementConfigEntry = NoSave(ConfigYesNo(default=hdd_replacement))
+		self.presetConfigEntry = NoSave(ConfigSelection(self.presetlist, default="generic"))
 
 	def createSetup(self):
 		self.activeEntry = (_("Active"), self.activeConfigEntry)
@@ -146,7 +154,12 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		self.hostEntry = (_("Host name"), self.hostConfigEntry)
 		self.sharedirEntry = (_("Server share"), self.sharedirConfigEntry)
 		self.hdd_replacementEntry = (_("use as HDD replacement"), self.hdd_replacementConfigEntry)
+		self.presetEntry = (_("Mount Preset"), self.presetConfigEntry)
 		self.list = [self.activeEntry, self.sharenameEntry, self.mounttypeEntry, self.ipEntry, self.hostEntry, self.sharedirEntry, self.hdd_replacementEntry]
+		
+		# Add preset selection for CIFS mounts
+		if self.mounttypeConfigEntry.value == "cifs":
+			self.list.append(self.presetEntry)
 		if self.optionsConfigEntry.value == self.optionsConfigEntry.default:
 			if self.mounttypeConfigEntry.value == "cifs":
 				self.optionsConfigEntry = NoSave(ConfigText(default="rw", visible_width=50, fixed_size=False))
@@ -161,6 +174,38 @@ class AutoMountEdit(Screen, ConfigListScreen):
 
 		self["config"].list = self.list
 		self["config"].l.setList(self.list)
+
+	def presetChanged(self, configElement):
+		"""Handle preset selection change"""
+		if configElement is None:
+			return
+			
+		preset_name = configElement.value
+		preset_options = get_preset_options(preset_name)
+		
+		# Update mount options
+		self.optionsConfigEntry.value = preset_options["options"]
+		
+		# Update username/password based on preset requirements
+		if preset_options["username"] == "required":
+			if not self.usernameConfigEntry.value:
+				self.usernameConfigEntry.value = "guest"  # Suggest default
+		elif preset_options["username"] == "":
+			self.usernameConfigEntry.value = ""
+			
+		if preset_options["password"] == "required":
+			if not self.passwordConfigEntry.value:
+				self.passwordConfigEntry.value = ""  # User needs to set this
+		elif preset_options["password"] == "":
+			self.passwordConfigEntry.value = ""
+		
+		# Force CIFS mount type for SMB presets
+		if preset_name != "generic":
+			self.mounttypeConfigEntry.value = "cifs"
+		
+		# Refresh the display only if widget is ready
+		if hasattr(self, "list") and "config" in self:
+			self.createSetup()
 
 	def newConfig(self):
 		if self["config"].getCurrent() == self.mounttypeEntry:
