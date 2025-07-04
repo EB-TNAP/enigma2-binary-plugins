@@ -2,6 +2,7 @@ import os
 import pickle
 import stat
 import time
+from threading import Thread
 
 from enigma import eTimer
 from Screens.Screen import Screen
@@ -133,6 +134,12 @@ class NetworkBrowser(Screen):
 		self.list = []
 		self.statuslist = []
 		self.listindex = 0
+		
+		# Async share detection support
+		self.share_detection_threads = {}
+		self.share_detection_results = {}
+		self.ShareDetectionTimer = eTimer()
+		self.ShareDetectionTimer.callback.append(self.checkShareDetectionResults)
 		self["list"] = List(self.list)
 		self["list"].onSelectionChanged.append(self.selectionChanged)
 
@@ -769,26 +776,23 @@ class NetworkBrowser(Screen):
 							print(f"[NetworkBrowser] Added SMB share: {x[3]}")
 				# Note: AFP support would need additional implementation
 			else:
-				# Windows devices - primarily SMB/CIFS
-				smblist = netscan.smbShare(hostip, hostname, username, password)
-				print(f"[NetworkBrowser] Legacy SMB scan found {len(smblist)} shares")
-				for x in smblist:
-					if len(x) == 6:
-						if x[3] != 'IPC$':
-							sharelist.append(x)
+				# Windows devices - skip legacy method due to authentication issues
+				print(f"[NetworkBrowser] Skipping legacy SMB scan for Windows device {hostip} - using modern method only")
+				pass
 		except Exception as e:
 			print(f"[NetworkBrowser] Legacy SMB/NFS scan failed: {e}")
 		
 		# Enhanced modern share detection for all systems
 		if len(sharelist) == 0 and devicetype in ['windows', 'mac', 'linux', 'unix']:
-			modern_shares = self.getModernSMBShares(hostip, hostname, username, password)
+			modern_shares = self.getModernSMBShares(hostip, hostname, username, password, devicetype)
 			sharelist.extend(modern_shares)
 			
 		return sharelist
 	
-	def getModernSMBShares(self, hostip, hostname, username, password):
-		"""Modern SMB share detection using smbclient with legacy fallback"""
+	def getModernSMBShares(self, hostip, hostname, username, password, devicetype='unknown'):
+		"""Modern SMB share detection using smbclient with conditional legacy fallback"""
 		shares = []
+		smbclient_failed_auth = False
 		
 		try:
 			import subprocess
@@ -796,7 +800,7 @@ class NetworkBrowser(Screen):
 			# Try modern smbclient first (SMB2/3 compatible)
 			try:
 				cmd = ['smbclient', '-L', hostip, '-N', '-g']
-				result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+				result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
 				
 				if result.returncode == 0:
 					for line in result.stdout.split('\n'):
@@ -808,25 +812,40 @@ class NetworkBrowser(Screen):
 								if share_name and share_name not in ['IPC$', 'print$', 'ADMIN$']:
 									share_entry = ['smbShare', hostname, hostip, share_name, share_name, share_desc]
 									shares.append(share_entry)
-					
 					return shares
+				
+				# Check for authentication failure - show authentication required message
+				elif 'NT_STATUS_LOGON_FAILURE' in result.stderr or 'session setup failed' in result.stderr:
+					print(f"[NetworkBrowser] Windows machine {hostip} requires authentication")
+					smbclient_failed_auth = True
+					# Return a helpful message instead of empty list
+					auth_entry = ['authRequired', hostname, hostip, 'Authentication Required', '---', 'Windows machine requires username and password']
+					return [auth_entry]
 					
+			except subprocess.TimeoutExpired:
+				print(f"[NetworkBrowser] SMB detection timed out for {hostip}")
+				return []
 			except FileNotFoundError:
+				print(f"[NetworkBrowser] smbclient not available for {hostip}, trying legacy method")
 				# smbclient not available, fall back to legacy method
 				pass
-			except Exception:
-				# Modern method failed, fall back to legacy
-				pass
+			except Exception as e:
+				print(f"[NetworkBrowser] SMB detection failed for {hostip}: {e}")
+				return []
 			
-			# Fallback to legacy netscan for systems without smbclient
-			try:
-				legacy_shares = netscan.smbShare(hostip, hostname, username, password)
-				shares.extend([s for s in legacy_shares if len(s) >= 6 and s[3] not in ['IPC$', 'print$', 'ADMIN$']])
-			except Exception:
-				pass
+			# Only try legacy netscan if smbclient wasn't available AND no auth failure AND not Windows
+			if not smbclient_failed_auth and devicetype != 'windows':
+				try:
+					print(f"[NetworkBrowser] Trying legacy netscan for {hostip} (devicetype: {devicetype})")
+					legacy_shares = netscan.smbShare(hostip, hostname, username, password)
+					shares.extend([s for s in legacy_shares if len(s) >= 6 and s[3] not in ['IPC$', 'print$', 'ADMIN$']])
+				except Exception as e:
+					print(f"[NetworkBrowser] Legacy SMB detection failed for {hostip}: {e}")
+			elif devicetype == 'windows':
+				print(f"[NetworkBrowser] Skipping legacy netscan for Windows device {hostip} to prevent hanging")
 		
-		except Exception:
-			pass
+		except Exception as e:
+			print(f"[NetworkBrowser] Overall SMB detection error for {hostip}: {e}")
 		
 		return shares
 	
@@ -941,13 +960,26 @@ class NetworkBrowser(Screen):
 			print(f"[NetworkBrowser] Device {ip} detected as: {self.device}")
 			
 			if x in self.expanded:
-				networkshares = self.getNetworkShares(x, hostname or ip, self.device)
 				hostentry = self.network[x][0][1]
 				name = hostentry[2] + " ( " + hostentry[1].strip() + " )"
 				expandedIcon = LoadPixmap(cached=True, path=resolveFilename(SCOPE_PLUGINS, "SystemPlugins/NetworkBrowser/icons/host.png"))
 				self.list.append((hostentry, expandedIcon, name, None, None, None, None))
-				for share in networkshares:
-					self.list.append(self.BuildNetworkShareEntry(share))
+				
+				# Check if we already have results for this host
+				if x in self.share_detection_results:
+					# Use cached results
+					networkshares = self.share_detection_results[x]
+					for share in networkshares:
+						self.list.append(self.BuildNetworkShareEntry(share))
+				else:
+					# Start async detection if not already running
+					if x not in self.share_detection_threads or not self.share_detection_threads[x].is_alive():
+						# Add placeholder entry
+						scanning_entry = ['scanning', hostname or ip, x, 'Scanning...', '---', 'Please wait while scanning for shares']
+						self.list.append(self.BuildNetworkShareEntry(scanning_entry))
+						
+						# Start async detection
+						self.startAsyncShareDetection(x, hostname or ip, self.device)
 			else:  # HOSTLIST - VIEW
 				hostentry = self.network[x][0][1]
 				name = hostentry[2] + " ( " + hostentry[1].strip() + " )"
@@ -966,6 +998,30 @@ class NetworkBrowser(Screen):
 		verticallineIcon = LoadPixmap(cached=True, path=resolveFilename(SCOPE_PLUGINS, "SystemPlugins/NetworkBrowser/icons/verticalLine.png"))
 		sharetype = share[0]
 		sharehost = share[2]
+
+		# Handle scanning indicator
+		if sharetype == 'scanning':
+			sharedir = share[3]
+			sharedescription = share[5]
+			newpng = LoadPixmap(cached=True, path=resolveFilename(SCOPE_PLUGINS, "SystemPlugins/NetworkBrowser/icons/i-nfs.png"))
+			isMountedpng = None
+			return ((share, verticallineIcon, None, sharedir, sharedescription, newpng, isMountedpng))
+		
+		# Handle error entries
+		elif sharetype == 'error':
+			sharedir = share[3]
+			sharedescription = share[5]
+			newpng = LoadPixmap(cached=True, path=resolveFilename(SCOPE_PLUGINS, "SystemPlugins/NetworkBrowser/icons/i-nfs.png"))
+			isMountedpng = None
+			return ((share, verticallineIcon, None, sharedir, sharedescription, newpng, isMountedpng))
+		
+		# Handle authentication required entries
+		elif sharetype == 'authRequired':
+			sharedir = share[3]
+			sharedescription = share[5]
+			newpng = LoadPixmap(cached=True, path=resolveFilename(SCOPE_PLUGINS, "SystemPlugins/NetworkBrowser/icons/i-smb.png"))
+			isMountedpng = None
+			return ((share, verticallineIcon, None, sharedir, sharedescription, newpng, isMountedpng))
 
 		# Handle traditional shares (SMB/NFS)
 		if sharetype == 'smbShare':
@@ -1114,9 +1170,11 @@ class NetworkBrowser(Screen):
 			os_info = detect_device_os(hostip, mac, hostname)
 			device_type = get_device_type_for_shares(hostip, mac, hostname)
 			
+			print(f"[NetworkBrowser] Manual scan for {hostip} detected as device_type: {device_type}")
+			
 			# Force modern share detection
 			self.scan_services = True  # Enable full service scanning
-			modern_shares = self.getModernSMBShares(hostip, hostname, 'guest', 'guest')
+			modern_shares = self.getModernSMBShares(hostip, hostname, 'guest', 'guest', device_type)
 			
 			if modern_shares:
 				# Force refresh the display to show new shares
@@ -1198,6 +1256,66 @@ class NetworkBrowser(Screen):
 	def MountEditClosed(self, returnValue=None):
 		if returnValue is None:
 			self.updateNetworkList()
+
+	def startAsyncShareDetection(self, hostip, hostname, devicetype):
+		"""Start share detection in background thread with timeout"""
+		def detect_shares():
+			import time
+			
+			try:
+				print(f"[NetworkBrowser] Starting async share detection for {hostip}")
+				start_time = time.time()
+				shares = self.getNetworkShares(hostip, hostname, devicetype)
+				end_time = time.time()
+				
+				self.share_detection_results[hostip] = shares
+				print(f"[NetworkBrowser] Async detection completed for {hostip}: {len(shares)} shares found in {end_time-start_time:.2f}s")
+				
+			except Exception as e:
+				print(f"[NetworkBrowser] Async share detection error for {hostip}: {e}")
+				# Store error result
+				error_entry = ['error', hostname, hostip, 'Detection Error', '---', str(e)]
+				self.share_detection_results[hostip] = [error_entry]
+		
+		thread = Thread(target=detect_shares, name=f"ShareDetect-{hostip}")
+		thread.daemon = True
+		thread.start()
+		self.share_detection_threads[hostip] = thread
+		
+		# Start timer to check for results
+		if not self.ShareDetectionTimer.isActive():
+			self.ShareDetectionTimer.start(500)  # Check every 500ms
+
+	def checkShareDetectionResults(self):
+		"""Check for completed share detection threads and update display"""
+		any_active = False
+		need_update = False
+		
+		for hostip, thread in list(self.share_detection_threads.items()):
+			if thread.is_alive():
+				any_active = True
+			else:
+				# Thread completed - check if we need to update
+				if hostip in self.expanded and hostip in self.share_detection_results:
+					need_update = True
+		
+		if need_update:
+			# Refresh the display with new results
+			current_index = self["list"].getIndex()
+			self.updateNetworkList()
+			self["list"].setIndex(current_index)
+		
+		if not any_active:
+			# All threads done - stop timer
+			self.ShareDetectionTimer.stop()
+
+	def cleanup(self):
+		"""Cleanup async detection resources"""
+		# Stop share detection timer
+		if hasattr(self, 'ShareDetectionTimer'):
+			self.ShareDetectionTimer.stop()
+		
+		# Note: Python threads can't be killed, but they're daemon threads so they'll die with the process
 
 
 class ScanIP(Screen, ConfigListScreen):
