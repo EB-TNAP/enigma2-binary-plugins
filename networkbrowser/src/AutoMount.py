@@ -180,8 +180,10 @@ class AutoMount():
 		return ",".join(options)
 
 	def CheckMountPoint(self, item, callback):
-		# possible CIFS version/security combinations
+		# possible CIFS version/security combinations - guest options first for passwordless shares
 		secvers = (
+			'guest,vers=3.0', 'guest,vers=2.1', 'guest,vers=1.0', 'guest',
+			'vers=3.0,sec=none', 'vers=2.1,sec=none', 'vers=1.0,sec=none',
 			'vers=3.0,sec=ntlmssp', 'vers=3.0,sec=ntlmv2', 'vers=2.1,sec=ntlmssp', 'vers=2.1,sec=ntlmv2',
 			'vers=2.1,sec=ntlm', 'vers=1.0,sec=ntlmssp', 'vers=1.0,sec=ntlmv2', 'vers=1.0,sec=ntlm',
 			'vers=default', ''

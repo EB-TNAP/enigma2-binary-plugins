@@ -63,9 +63,6 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		ConfigListScreen.__init__(self, self.list, session=self.session)
 		self.createSetup()
 		
-		# Add preset change notifier after ConfigListScreen is ready
-		self.presetConfigEntry.addNotifier(self.presetChanged)
-		
 		self.onLayoutFinish.append(self.layoutFinished)
 		# Initialize Buttons
 		self["VKeyIcon"] = Boolean(False)
@@ -76,6 +73,8 @@ class AutoMountEdit(Screen, ConfigListScreen):
 
 	def layoutFinished(self):
 		self.setTitle(_("Mounts editor"))
+		# Add preset change notifier after UI is ready
+		self.presetConfigEntry.addNotifier(self.presetChanged)
 
 	def exit(self):
 		self.close()
@@ -144,7 +143,36 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		self.passwordConfigEntry = NoSave(ConfigPassword(default=password, visible_width=50, fixed_size=False))
 		self.mounttypeConfigEntry = NoSave(ConfigSelection(self.sharetypelist, default=mounttype))
 		self.hdd_replacementConfigEntry = NoSave(ConfigYesNo(default=hdd_replacement))
-		self.presetConfigEntry = NoSave(ConfigSelection(self.presetlist, default="generic"))
+		# Detect appropriate preset based on current mount options
+		detected_preset = self.detectPreset(options, username, mounttype)
+		self.presetConfigEntry = NoSave(ConfigSelection(self.presetlist, default=detected_preset))
+
+	def detectPreset(self, options, username, mounttype):
+		"""Detect the best matching preset based on current mount configuration"""
+		if mounttype != "cifs":
+			return "generic"
+		
+		# Check for exact option matches first
+		from .MountPresets import MOUNT_PRESETS
+		for preset_id, preset_data in MOUNT_PRESETS.items():
+			if preset_data["options"] == options:
+				return preset_id
+		
+		# Check for guest access patterns
+		if not username or username == "":
+			if "guest" in options:
+				return "ubuntu_guest"
+		
+		# Check for specific version/security combinations
+		if "vers=3.0" in options and "sec=ntlmssp" in options:
+			return "windows_modern"
+		elif "vers=2" in options:
+			if "sec=ntlmssp" in options or "sec=ntlmv2" in options:
+				return "nas_device"
+			else:
+				return "windows_legacy"
+		
+		return "generic"
 
 	def createSetup(self):
 		self.activeEntry = (_("Active"), self.activeConfigEntry)
@@ -203,9 +231,17 @@ class AutoMountEdit(Screen, ConfigListScreen):
 		if preset_name != "generic":
 			self.mounttypeConfigEntry.value = "cifs"
 		
-		# Refresh the display only if widget is ready
-		if hasattr(self, "list") and "config" in self:
+		# Trigger change notifications for updated elements
+		self.optionsConfigEntry.changed()
+		self.usernameConfigEntry.changed()
+		self.passwordConfigEntry.changed()
+		self.mounttypeConfigEntry.changed()
+		
+		# Refresh the display 
+		if hasattr(self, "list") and "config" in self and self["config"].list:
 			self.createSetup()
+			# Force refresh of the config list display
+			self["config"].l.setList(self.list)
 
 	def newConfig(self):
 		if self["config"].getCurrent() == self.mounttypeEntry:
