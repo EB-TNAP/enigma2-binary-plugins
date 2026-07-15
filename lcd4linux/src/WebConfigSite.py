@@ -4,18 +4,22 @@ from glob import glob
 from os import stat
 from os.path import isfile, join, basename
 from six import PY2, ensure_str, ensure_binary
+from time import time
+from twisted.web import resource, http
 if PY2:
 	from HTMLParser import HTMLParser
 	_unescape = HTMLParser().unescape
 else:
 	from html import unescape as _unescape
-from time import time
-from twisted.web import resource, http
+
 from enigma import eTimer
-from Components.config import ConfigSelection
+from Components.config import ConfigSelection, ConfigYesNo, ConfigText, ConfigSlider, ConfigClock, ConfigPassword
 from Tools.Directories import resolveFilename, SCOPE_PLUGINS, SCOPE_CONFIG
 from .module import L4Lelement
-from .plugin import *
+from .plugin import L4log, L4logE, getScreenActive, setConfigMode, setisMediaPlayer, setConfigStandby, getConfigStandby, getisMediaPlayer, getBilder
+from .plugin import L4LoadNewConfig, ConfTimeCheck, rmFile, rmFiles, setPopText, setScreenActive, getSaveEventListChanged, setSaveEventListChanged
+from .plugin import getMJPEGreader, xmlRead, xmlWrite, xmlClear, xmlDelete, xmlSkin, MJPEG_stop, MJPEG_start, setFONT, resetWetter, resetCal
+from .plugin import getWWW, getINFO, getTMPL, getConfigMode, PopText, Version, WWWpic, PICfritz, LCD4linux, LCD4config, CrashFile
 from . import _
 
 from .configOptions import L1, L2, L3, L4
@@ -46,20 +50,12 @@ def _l(st):
 
 
 def AktiveMode(Test, R):
-	Aktiv = ""
-	Color = ""
-	if Mode == Test:
-		Aktiv = "checked"
-		Color = "style=\"color: #FFCC00\""
+	Aktiv, Color = ("checked", 'style=\"color: #FFCC00\"') if Mode == Test else ("", "")
 	return Aktiv, Color, R
 
 
 def AktiveElement(Test):
-	Aktiv = ""
-	Color = ""
-	if Element == Test:
-		Aktiv = "checked"
-		Color = "style=\"color: #FFCC00\""
+	Aktiv, Color = ("checked", 'style=\"color: #FFCC00\"') if Element == Test else ("", "")
 	return Aktiv, Color
 
 
@@ -101,12 +97,7 @@ class LCD4linuxConfigweb(resource.Resource):
 		return self.action(request)
 
 	def action(self, req):
-		global Mode
-		global ModeOld
-		global Element
-		global ElementList
-		global ExeMode
-		global StatusMode
+		global Mode, ModeOld, Element, ElementList, ExeMode, StatusMode
 		IP = ensure_str(req.getClientIP())
 		IP = IP.split(":")[-1]
 		L4logE("IP1:", IP)
@@ -190,18 +181,16 @@ class LCD4linuxConfigweb(resource.Resource):
 			req.setHeader('Content-Disposition', 'attachment;filename=lcd4config')
 			req.setHeader('Content-Length', str(stat(lcd4config).st_size))
 			req.setHeader('charset', 'UTF-8')
-			f = open(lcd4config, "r")
-			html = f.read()
-			f.close()
+			with open(lcd4config, "r") as f:
+				html = f.read()
 			return ensure_binary(html)
 		if req.args.get(b"upload.y", None) is not None:
 			L4log("WebIF: upload Config")
 			lcd4config = "/tmp/test"
 			data = req.args[b"uploadName"][0]
 			if len(data) > 0 and data.startswith(b"config."):
-				f = open(lcd4config, "wb")
-				f.write(data)
-				f.close()
+				with open(lcd4config, "wb") as f:
+					f.write(data)
 				if isfile(lcd4config):
 					L4LoadNewConfig(lcd4config)
 			else:
@@ -221,9 +210,8 @@ class LCD4linuxConfigweb(resource.Resource):
 				req.setHeader('Content-Disposition', 'attachment;filename=l4log.txt')
 				req.setHeader('Content-Length', str(stat(lcd4config).st_size))
 				req.setHeader('charset', 'UTF-8')
-				f = open(lcd4config, "r")
-				html = f.read()
-				f.close()
+				with open(lcd4config, "r") as f:
+					html = f.read()
 				return ensure_binary(html)
 		if command is None:
 			L4logE("no command")
@@ -373,9 +361,8 @@ class LCD4linuxConfigweb(resource.Resource):
 #ConfigClock
 									if isinstance(ConfObj, ConfigClock):
 										t = val.split(":")
-										if len(t) == 2:
-											if t[0].isdigit() and t[1].isdigit():
-												ConfObj.value = [int(t[0]), int(t[1])]
+										if len(t) == 2 and t[0].isdigit() and t[1].isdigit():
+											ConfObj.value = [int(t[0]), int(t[1])]
 					if ConfObj.isChanged():
 						ConfObj.save()
 						L4log("Changed", a)
@@ -459,7 +446,6 @@ class LCD4linuxConfigweb(resource.Resource):
 		html += "vertical-align: middle; font-size:8px; }\n"
 		html += "</style>\n"
 		if L4LElement.getRefresh() == True:
-			glob
 			GI = getINFO().split()
 			GR = min(int(float(GI[6])) + 1, 6) if len(GI) > 6 else 6
 			html += "<meta http-equiv=\"refresh\" content=\"%d\">\n" % GR
@@ -551,7 +537,7 @@ class LCD4linuxConfigweb(resource.Resource):
 				Conf = LL[2].strip()
 				if Mode == "1":
 					Conf = Conf[:13]
-				if ((LL[1][:1] != "-" and Mode != "1") or (Mode == "1" and Conf not in ElementList)) and LL[3] != 0:
+				if ((not LL[1].startswith("-") and Mode != "1") or (Mode == "1" and Conf not in ElementList)) and LL[3] != 0:
 					if Element == "" or ModeOld != Mode:
 						Element = "other"
 						ModeOld = Mode
@@ -604,14 +590,13 @@ class LCD4linuxConfigweb(resource.Resource):
 							b = Conf.replace(".MP", ".Standby")
 							if (" " + b) in list(zip(*L4))[2]:
 								isSb = True
-					elif Mode in "4":
-						if ".Standby" in Conf:
-							b = Conf.replace(".Standby", ".")
-							if (" " + b) in list(zip(*L2))[2]:
-								isOn = True
-							b = Conf.replace(".Standby", ".MP")
-							if (" " + b) in list(zip(*L3))[2]:
-								isMP = True
+					elif Mode in "4" and ".Standby" in Conf:
+						b = Conf.replace(".Standby", ".")
+						if (" " + b) in list(zip(*L2))[2]:
+							isOn = True
+						b = Conf.replace(".Standby", ".MP")
+						if (" " + b) in list(zip(*L3))[2]:
+							isMP = True
 					if AktCode == 0:
 						AktCode = LL[3]
 					Curr = ConfObj.value

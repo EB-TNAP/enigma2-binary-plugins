@@ -29,6 +29,8 @@
 
 static PyObject *error;
 
+int showNfsShare(char *pythonIp, nfsinfo *nfsInfo);
+
 PyObject *_netzInfo(PyObject *self, PyObject *args)
 {
 	netinfo *nInfo;
